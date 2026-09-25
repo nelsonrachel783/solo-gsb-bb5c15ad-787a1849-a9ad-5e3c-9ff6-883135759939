@@ -13,6 +13,17 @@
 * top_cut <  bottom_cut        -> 5prime（5' 突出端），突出序列 = top 链 [top, bottom) 区段
 * top_cut >  bottom_cut        -> 3prime（3' 突出端），突出序列 = top 链 [bottom, top) 区段
 * 线性分子的天然末端 / 未切割的完整分子 -> none
+
+同坐标事件合并
+--------------
+环形序列取模后，不同酶（或不同位点）可能产生相同的归一化坐标
+``(top_cut, bottom_cut)``。只有**末端类型与突出端序列完全一致**的
+事件才能合并为同一条切口（酶名与位点照常合并）；一旦同坐标事件的
+``(end_type, overhang)`` 出现分歧，说明两种酶在同一对链间键上要求
+互不相容的末端（如同一 (0,3) 既是 5' 突出 AAA 又是 3' 突出 A），
+结果没有物理上唯一的答案。此时 :func:`compute_cuts` 抛出
+:class:`ConflictingCutError`（内含全部冲突坐标），调用方应整体拒绝
+（HTTP 422），而不是任选一个末端继续生成片段。
 """
 
 from __future__ import annotations
@@ -23,6 +34,41 @@ BLUNT = "blunt"
 FIVE_PRIME = "5prime"
 THREE_PRIME = "3prime"
 NONE = "none"
+
+
+class ConflictingCutError(ValueError):
+    """同归一化坐标上出现互不相容的末端（end_type/overhang 不一致）。
+
+    ``conflicts`` 为按坐标排序的列表，每项形如::
+
+        {"coordinate": (top, bottom),
+         "variants": [{"end_type": ..., "overhang": ..., "enzymes": [...]}, ...]}
+
+    同一坐标的变体按 (end_type, overhang) 排序，酶名排序，
+    保证错误信息与输入顺序无关。
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        super().__init__(format_conflicting_cuts(conflicts))
+
+
+def format_conflicting_cuts(conflicts: list[dict]) -> str:
+    """把冲突坐标与各自的末端变体渲染为稳定的单行英文错误说明。"""
+    parts = []
+    for item in conflicts:
+        top, bottom = item["coordinate"]
+        variants = "; ".join(
+            f"{v['end_type']} overhang '{v['overhang']}' via enzyme(s) "
+            + ", ".join(v["enzymes"])
+            for v in item["variants"]
+        )
+        parts.append(f"({top}, {bottom}): {variants}")
+    return (
+        "conflicting ends at cut coordinate(s) normalized on the circular "
+        "molecule — events at the same (top_cut, bottom_cut) must agree on "
+        "end type and overhang: " + " | ".join(parts)
+    )
 
 
 def find_sites(sequence: str, pattern: str, circular: bool):
@@ -67,6 +113,13 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
         top_cut    = start + k - cut_bottom
         bottom_cut = start + k - cut_top
     同一物理切口（top、bottom 均相同）只保留一条记录，酶名与位点合并。
+
+    环形序列的切口坐标先对长度取模再合并。取模后落到同一
+    (top_cut, bottom_cut) 的事件只有在 ``end_type`` 与 ``overhang``
+    完全一致时才允许合并；出现分歧即抛出 :class:`ConflictingCutError`
+    （枚举全部事件后一次性抛出，含全部冲突坐标），调用方不得在冲突
+    坐标上继续生成片段。
+
     返回列表按 (top_cut, bottom_cut) 排序，保证相同输入的输出顺序一致。
     """
     circular = topology == "circular"
@@ -75,6 +128,8 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
     max_k = max(len(e.pattern) for e in enzymes)
     haystack = sequence + sequence[:max_k] if circular else sequence
 
+    # 每个归一化坐标保留其全部互异 (end_type, overhang) 变体；
+    # 正常情况下只有一种，出现多种即为冲突
     merged: dict[tuple[int, int], dict] = {}
     for enz in sorted(enzymes, key=lambda e: (e.name, e.pattern, e.cut_top, e.cut_bottom)):
         k = len(enz.pattern)
@@ -97,13 +152,16 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
                     entry = merged[key] = {
                         "top_cut": top,
                         "bottom_cut": bottom,
-                        "end_type": end_type,
-                        "overhang": overhang,
-                        "enzymes": set(),
-                        "sites": [],
+                        # variants: {(end_type, overhang): 同变体事件聚合}
+                        "variants": {},
                     }
-                entry["enzymes"].add(enz.name)
-                entry["sites"].append(
+                variant = entry["variants"].setdefault(
+                    (end_type, overhang),
+                    {"end_type": end_type, "overhang": overhang,
+                     "enzymes": set(), "sites": []},
+                )
+                variant["enzymes"].add(enz.name)
+                variant["sites"].append(
                     {
                         "enzyme": enz.name,
                         "start": start,
@@ -112,11 +170,40 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
                     }
                 )
 
+    # 同坐标存在互不相容的末端变体：收集全部冲突坐标后整体拒绝，
+    # 绝不在冲突坐标上任选一个末端继续
+    conflicts = []
+    for key in sorted(merged):
+        entry = merged[key]
+        if len(entry["variants"]) <= 1:
+            continue
+        variants = []
+        for etype, overhang in sorted(entry["variants"]):
+            v = entry["variants"][(etype, overhang)]
+            variants.append(
+                {
+                    "end_type": etype,
+                    "overhang": overhang,
+                    "enzymes": sorted(v["enzymes"]),
+                }
+            )
+        conflicts.append({"coordinate": key, "variants": variants})
+    if conflicts:
+        raise ConflictingCutError(conflicts)
+
     cuts = []
     for entry in merged.values():
-        entry["enzymes"] = sorted(entry["enzymes"])
-        entry["sites"].sort(key=lambda s: (s["enzyme"], s["start"], s["strand"]))
-        cuts.append(entry)
+        variant = next(iter(entry["variants"].values()))  # 无冲突：唯一变体
+        cut = {
+            "top_cut": entry["top_cut"],
+            "bottom_cut": entry["bottom_cut"],
+            "end_type": variant["end_type"],
+            "overhang": variant["overhang"],
+            "enzymes": sorted(variant["enzymes"]),
+            "sites": variant["sites"],
+        }
+        cut["sites"].sort(key=lambda s: (s["enzyme"], s["start"], s["strand"]))
+        cuts.append(cut)
     cuts.sort(key=lambda c: (c["top_cut"], c["bottom_cut"]))
     return cuts
 

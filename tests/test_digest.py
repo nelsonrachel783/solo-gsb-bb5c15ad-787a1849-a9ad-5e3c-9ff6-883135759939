@@ -1,6 +1,8 @@
 """酶切核心算法测试。"""
 
-from app.digest import run_digest
+import pytest
+
+from app.digest import ConflictingCutError, run_digest
 from app.iupac import reverse_complement
 
 
@@ -145,6 +147,47 @@ def test_physical_cut_deduplicated():
     assert len(result["cuts"]) == 1
     assert result["cuts"][0]["enzymes"] == ["EcoRI", "EcoRI-twin"]
     assert len(result["fragments"]) == 2
+
+
+def test_circular_modulo_same_coordinate_conflicting_ends_rejected():
+    # 序列 AAAA（环形），模式 AAAA：偏移 (0,3) 的事件 (top,bottom)=(0,3)
+    # 为 5' 突出 AAA；偏移 (1,0) 的事件因跨原点取模同样落到 (0,3)，
+    # 但它是 3' 突出 A。同一归一化坐标末端互不相容 -> 拒绝，
+    # 不再随酶名排序在 5prime/AAA 与 3prime/A 之间任选。
+    e_a = FakeEnzyme("A", "AAAA", 0, 3)
+    e_b = FakeEnzyme("B", "AAAA", 1, 0)
+    with pytest.raises(ConflictingCutError) as exc:
+        run_digest("AAAA", "circular", [e_a, e_b])
+    coords = [c["coordinate"] for c in exc.value.conflicts]
+    assert coords == [(0, 3), (1, 0), (2, 1), (3, 2)]
+    for item in exc.value.conflicts:
+        assert [v["end_type"] for v in item["variants"]] == ["3prime", "5prime"]
+        assert sorted(v["overhang"] for v in item["variants"]) == ["A", "AAA"]
+
+    # 交换酶传入顺序与命名，冲突坐标与信息完全一致（不再依赖酶名排序）
+    with pytest.raises(ConflictingCutError) as exc2:
+        run_digest("AAAA", "circular", [e_b, e_a])
+    assert str(exc.value) == str(exc2.value)
+
+
+def test_circular_modulo_same_coordinate_consistent_ends_merged():
+    # 同一识别位点起于 0 与 L（跨原点的同一物理位置），切口 (0,0) 两次；
+    # 两次均为 blunt、突出端相同 -> 合法，合并酶名与位点（仅一条切口）。
+    # 注：find_sites 的起点范围为 [0, L)，跨原点同一物理位点只由起点 0 命中。
+    e1 = FakeEnzyme("E1", "AC", 0, 0)
+    e2 = FakeEnzyme("E2", "AC", 0, 0)
+    result = run_digest("AC", "circular", [e1, e2])
+    assert len(result["cuts"]) == 1
+    cut = result["cuts"][0]
+    assert (cut["top_cut"], cut["bottom_cut"]) == (0, 0)
+    assert cut["end_type"] == "blunt"
+    assert cut["overhang"] == ""
+    assert cut["enzymes"] == ["E1", "E2"]
+    assert [(s["enzyme"], s["start"]) for s in cut["sites"]] == [("E1", 0), ("E2", 0)]
+    # 单边界开环：一条全长片段，两端平端
+    assert len(result["fragments"]) == 1
+    frag = result["fragments"][0]
+    assert frag["length"] == 2 and frag["left_end"]["type"] == "blunt"
 
 
 def test_circular_shared_top_cut_single_boundary():

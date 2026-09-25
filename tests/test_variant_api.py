@@ -154,6 +154,33 @@ def test_circular_variant_analysis(client):
     assert data["fragments"]["after_lengths"] == [10]
 
 
+def test_variant_induced_same_coordinate_conflict_returns_422_and_keeps_record(client):
+    # 合法记录 GAAA（环形）：A=(AAAA,0/3) 在原序列上无位点；B=(A,1/0)
+    # 正常切割，记录无冲突。位置 0 的 G->A 使序列成为 AAAA，A 的事件
+    # (0,3..) 与 B 的事件在取模后同坐标且末端不相容（5' AAA vs 3' A）：
+    # 变异分析返回 422（含冲突坐标），且只在内存中重算，原记录不改、不新增。
+    payload = {
+        "sequence": "GAAA",
+        "topology": "circular",
+        "enzymes": [
+            {"name": "A", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+            {"name": "B", "pattern": "A", "cut_top": 1, "cut_bottom": 0},
+        ],
+    }
+    created = client.post("/digests", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+
+    resp = _analyze(client, body["id"], [{"position": 0, "alt": "A"}])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "(0, 3)" in detail and "5prime" in detail and "3prime" in detail
+
+    # 原记录保持不变，且没有产生任何新提交
+    assert client.get(f"/digests/{body['id']}").json() == body
+    assert len(client.get("/digests").json()) == 1
+
+
 def test_position_out_of_bounds_returns_422(client):
     body = _create(client)  # 长度 14
     for bad_pos in (14, 100):

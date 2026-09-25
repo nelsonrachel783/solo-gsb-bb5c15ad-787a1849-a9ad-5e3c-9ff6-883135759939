@@ -113,6 +113,24 @@ def test_circular_planning(client):
     assert [(c["top_cut"], c["bottom_cut"]) for c in data["cuts"]] == [(1, 5), (13, 13)]
 
 
+def test_conflicting_candidate_combo_returns_422_and_is_read_only(client):
+    # 合法记录（环形 AAAA，用 EcoRI 创建——该序列上无位点，cuts 为空）。
+    # 候选 A=(AAAA,0/3) 与 B=(A,1/0)：单酶分别只产生 4 个边界（4 片段），
+    # 因此目标片段数 2 会强制枚举到两者联用；联用后取模同坐标、末端不相容
+    # （5' AAA vs 3' A）-> 整体 422（含冲突坐标），原记录不改动。
+    body = _create(client, sequence="AAAA", topology="circular")
+    assert body["cuts"] == []
+    cand_a = {"name": "A", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3}
+    cand_b = {"name": "B", "pattern": "A", "cut_top": 1, "cut_bottom": 0}
+    resp = _plan(client, body["id"], 2, [cand_a, cand_b])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "(0, 3)" in detail and "5prime" in detail and "3prime" in detail
+
+    assert client.get(f"/digests/{body['id']}").json() == body
+    assert len(client.get("/digests").json()) == 1
+
+
 def test_no_solution_returns_422(client):
     body = _create(client)
     for impossible_target in (4, 5, 100):  # 两酶最多切出 3 片段

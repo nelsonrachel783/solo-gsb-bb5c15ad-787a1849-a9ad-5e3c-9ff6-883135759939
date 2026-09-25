@@ -62,7 +62,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from .db import Database
-from .digest import run_digest
+from .digest import ConflictingCutError, run_digest
 from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gccontent import gc_content_windows
@@ -136,6 +136,11 @@ def _build_response(record: dict) -> dict:
     }
 
 
+def _conflict_http_error(err: ConflictingCutError) -> HTTPException:
+    """环形取模后同坐标末端冲突 -> 422，错误说明含全部冲突坐标。"""
+    return HTTPException(status_code=422, detail=str(err))
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -143,9 +148,13 @@ def health() -> dict:
 
 @app.post("/digests", status_code=201, response_model=DigestResponse)
 def create_digest(request: DigestRequest) -> dict:
-    # Pydantic 已在此前完成全部校验（含切口偏移合法性），
-    # 非法请求在写库之前即以 422 拒绝，保证整次保存被拒绝。
-    result = run_digest(request.sequence, request.topology, request.enzymes)
+    # Pydantic 已在此前完成全部校验（含切口偏移合法性）。
+    # 冲突检测在写库之前完成：环形取模后同坐标事件末端不一致即以 422
+    # 拒绝（detail 含冲突坐标），保证整次保存被拒绝、无任何数据落库。
+    try:
+        result = run_digest(request.sequence, request.topology, request.enzymes)
+    except ConflictingCutError as exc:
+        raise _conflict_http_error(exc)
     submission_id, created_at = db.save_submission(
         request.sequence, request.topology, request.enzymes, result
     )
@@ -203,7 +212,12 @@ def analyze_variants(submission_id: int, request: VariantAnalysisRequest) -> dic
     enzymes = [EnzymeIn(**e) for e in record["enzymes"]]
     variant_sequence = apply_substitutions(sequence, request.variants)
     before = record["result"]
-    after = run_digest(variant_sequence, record["topology"], enzymes)
+    try:
+        after = run_digest(variant_sequence, record["topology"], enzymes)
+    except ConflictingCutError as exc:
+        # 变异后序列上出现同坐标末端冲突：422（含冲突坐标）；
+        # 仅在内存中重算，原记录不会被改动
+        raise _conflict_http_error(exc)
 
     return {
         "id": record["id"],
@@ -226,12 +240,17 @@ def plan_panel(submission_id: int, request: EnzymePanelPlanRequest) -> dict:
         raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
 
     # 仅在内存中枚举候选组合并复用酶切计算，原记录与数据库均不改动
-    plan = plan_enzyme_panel(
-        record["sequence"],
-        record["topology"],
-        request.candidates,
-        request.target_fragment_count,
-    )
+    try:
+        plan = plan_enzyme_panel(
+            record["sequence"],
+            record["topology"],
+            request.candidates,
+            request.target_fragment_count,
+        )
+    except ConflictingCutError as exc:
+        # 候选组合在环形取模后产生同坐标末端冲突：422（含冲突坐标），
+        # 枚举只在内存中进行，原记录不改动
+        raise _conflict_http_error(exc)
     if plan is None:
         raise HTTPException(
             status_code=422,

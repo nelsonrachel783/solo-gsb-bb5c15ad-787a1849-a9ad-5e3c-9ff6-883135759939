@@ -134,6 +134,54 @@ def test_circular_shared_top_cut_counts_consistent(client):
     assert items[0]["fragment_count"] == len(body["fragments"]) == 1
 
 
+def test_circular_conflicting_same_coordinate_ends_rejected_and_not_persisted(client):
+    # 环形 AAAA：偏移 (0,3) 的事件取模后落到 (0,3) 为 5' 突出 AAA，
+    # 偏移 (1,0) 的事件同样落到 (0,3) 却为 3' 突出 A ——
+    # 同一归一化坐标末端互不相容：422，detail 含冲突坐标，且不落库。
+    payload = eco_request(
+        sequence="AAAA",
+        topology="circular",
+        enzymes=[
+            {"name": "A", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+            {"name": "B", "pattern": "AAAA", "cut_top": 1, "cut_bottom": 0},
+        ],
+    )
+    resp = client.post("/digests", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # 全部四个取模后冲突坐标都出现在错误说明中
+    for coord in ("(0, 3)", "(1, 0)", "(2, 1)", "(3, 2)"):
+        assert coord in detail
+    assert "5prime" in detail and "3prime" in detail
+    assert client.get("/digests").json() == []  # 创建请求被拒绝，无任何落库
+
+    # 交换酶顺序（同一物理输入）错误结果一致，不随酶名排序变化
+    payload["enzymes"] = list(reversed(payload["enzymes"]))
+    resp2 = client.post("/digests", json=payload)
+    assert resp2.status_code == 422
+    assert resp2.json()["detail"] == detail
+    assert client.get("/digests").json() == []
+
+
+def test_circular_consistent_same_coordinate_merged_via_api(client):
+    # 同坐标、同平端、同突出端的合法事件继续合并
+    payload = eco_request(
+        sequence="AC",
+        topology="circular",
+        enzymes=[
+            {"name": "E1", "pattern": "AC", "cut_top": 0, "cut_bottom": 0},
+            {"name": "E2", "pattern": "AC", "cut_top": 0, "cut_bottom": 0},
+        ],
+    )
+    resp = client.post("/digests", json=payload)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert len(body["cuts"]) == 1
+    assert (body["cuts"][0]["top_cut"], body["cuts"][0]["bottom_cut"]) == (0, 0)
+    assert body["cuts"][0]["enzymes"] == ["E1", "E2"]
+    assert len(body["fragments"]) == 1  # 单边界开环为一条全长片段
+
+
 def test_same_input_same_result_order(client):
     payload = eco_request(
         sequence="GAATTCAAAAGATATCTTTTGGTACC",
