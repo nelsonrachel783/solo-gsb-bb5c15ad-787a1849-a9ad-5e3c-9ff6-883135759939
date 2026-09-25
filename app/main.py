@@ -2,10 +2,13 @@
 
 启动时（lifespan）自动完成数据库初始化；接口：
     POST /digests                          提交序列与酶列表，执行酶切并保存，返回完整结果
+                                           （同坐标切口末端冲突返回 422，不落库）
     GET  /digests                          列出全部提交的摘要
     GET  /digests/{id}                     按 id 查询保存的完整酶切结果
-    POST /digests/{id}/variant-analysis    基于已保存记录施加单碱基替换，重跑酶切并对比差异（不落库）
-    POST /digests/{id}/enzyme-panel-plan   枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读，不落库）
+    POST /digests/{id}/variant-analysis    基于已保存记录施加单碱基替换，重跑酶切并对比差异
+                                           （不落库；变异后切口末端冲突返回 422）
+    POST /digests/{id}/enzyme-panel-plan   枚举候选酶组合，寻找达到目标片段数的最少酶集合
+                                           （只读，不落库；组合切口末端冲突返回 422）
     POST /digests/{id}/partial-digest-distribution
                                            为每个已保存切口指定独立切割概率，枚举成功/失败
                                            状态并返回片段长度多重集的概率分布（只读，不落库）
@@ -59,10 +62,11 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .db import Database
-from .digest import run_digest
+from .digest import CutConflictError, run_digest
 from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gccontent import gc_content_windows
@@ -123,6 +127,16 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(CutConflictError)
+async def cut_conflict_handler(_request: Request, exc: CutConflictError) -> JSONResponse:
+    """同坐标切口末端冲突统一转为 422（detail 列出全部冲突坐标）。
+
+    冲突在写库之前（POST /digests）或纯内存计算（变异分析、酶组合规划）
+    中抛出：创建请求不会有任何数据落库，只读分析不改动原记录。
+    """
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
 def _build_response(record: dict) -> dict:
     return {
         "id": record["id"],
@@ -143,8 +157,9 @@ def health() -> dict:
 
 @app.post("/digests", status_code=201, response_model=DigestResponse)
 def create_digest(request: DigestRequest) -> dict:
-    # Pydantic 已在此前完成全部校验（含切口偏移合法性），
-    # 非法请求在写库之前即以 422 拒绝，保证整次保存被拒绝。
+    # Pydantic 已在此前完成全部校验（含切口偏移合法性）；
+    # 同坐标切口末端冲突由 run_digest 抛出 CutConflictError（见异常处理器），
+    # 同样在写库之前以 422 拒绝——两种非法都不会有任何数据落库。
     result = run_digest(request.sequence, request.topology, request.enzymes)
     submission_id, created_at = db.save_submission(
         request.sequence, request.topology, request.enzymes, result
@@ -199,7 +214,8 @@ def analyze_variants(submission_id: int, request: VariantAnalysisRequest) -> dic
             ),
         )
 
-    # 仅在内存中施加替换并重跑酶切，原记录与数据库均不改动
+    # 仅在内存中施加替换并重跑酶切，原记录与数据库均不改动；
+    # 变异后序列出现同坐标切口末端冲突时由异常处理器返回 422
     enzymes = [EnzymeIn(**e) for e in record["enzymes"]]
     variant_sequence = apply_substitutions(sequence, request.variants)
     before = record["result"]
@@ -225,7 +241,8 @@ def plan_panel(submission_id: int, request: EnzymePanelPlanRequest) -> dict:
     if record is None:
         raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
 
-    # 仅在内存中枚举候选组合并复用酶切计算，原记录与数据库均不改动
+    # 仅在内存中枚举候选组合并复用酶切计算，原记录与数据库均不改动；
+    # 任一组合出现同坐标切口末端冲突时由异常处理器返回 422
     plan = plan_enzyme_panel(
         record["sequence"],
         record["topology"],

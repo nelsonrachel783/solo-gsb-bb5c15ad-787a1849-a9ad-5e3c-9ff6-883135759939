@@ -1,6 +1,8 @@
 """酶切核心算法测试。"""
 
-from app.digest import run_digest
+import pytest
+
+from app.digest import CutConflictError, run_digest
 from app.iupac import reverse_complement
 
 
@@ -145,6 +147,43 @@ def test_physical_cut_deduplicated():
     assert len(result["cuts"]) == 1
     assert result["cuts"][0]["enzymes"] == ["EcoRI", "EcoRI-twin"]
     assert len(result["fragments"]) == 2
+
+
+def test_circular_modulo_coordinate_conflict_rejected():
+    # 环形 AAAA 上模式 AAAA：偏移 (0,3) 在 start 0 产生原始切口 (0,3)，
+    # 偏移 (1,0) 在 start 3 产生原始切口 (4,3)——取模后同为 (0,3)，
+    # 但末端分别为 5prime/AAA 与 3prime/A，合并结果会随酶名排序变化
+    e1 = FakeEnzyme("E1", "AAAA", 0, 3)
+    e2 = FakeEnzyme("E2", "AAAA", 1, 0)
+    with pytest.raises(CutConflictError) as excinfo:
+        run_digest("AAAA", "circular", [e1, e2])
+    conflicts = excinfo.value.conflicts
+    coords = [(c["top_cut"], c["bottom_cut"]) for c in conflicts]
+    assert (0, 3) in coords
+    entry = conflicts[coords.index((0, 3))]
+    assert entry["ends"] == [("3prime", "A"), ("5prime", "AAA")]
+    assert "(0, 3)" in str(excinfo.value)
+    # 与酶传入顺序无关：同样的冲突必然同样被拒绝
+    with pytest.raises(CutConflictError):
+        run_digest("AAAA", "circular", [e2, e1])
+
+
+def test_circular_modulo_coordinate_consistent_merge():
+    # 取模后同坐标且末端一致：合法合并，酶与位点照常归并。
+    # E1 在 start 0 产生原始切口 (0,3)；E2 在 start 3 产生原始切口 (4,7)，
+    # 取模后同为 (0,3)，且末端同为 5prime/AAA
+    e1 = FakeEnzyme("E1", "AAAA", 0, 3)
+    e2 = FakeEnzyme("E2", "AAAA", 1, 4)
+    result = run_digest("AAAA", "circular", [e1, e2])
+    assert len(result["cuts"]) == 4  # (0,3) (1,0) (2,1) (3,2)，每个坐标两酶合并
+    cut = next(c for c in result["cuts"] if (c["top_cut"], c["bottom_cut"]) == (0, 3))
+    assert cut["end_type"] == "5prime"
+    assert cut["overhang"] == "AAA"
+    assert cut["enzymes"] == ["E1", "E2"]
+    assert [(s["enzyme"], s["start"]) for s in cut["sites"]] == [("E1", 0), ("E2", 3)]
+    # 环形跨原点片段按已有规则生成：四个唯一边界 -> 四条长度 1 的片段
+    assert [f["length"] for f in result["fragments"]] == [1, 1, 1, 1]
+    assert sum(f["length"] for f in result["fragments"]) == 4
 
 
 def test_circular_shared_top_cut_single_boundary():

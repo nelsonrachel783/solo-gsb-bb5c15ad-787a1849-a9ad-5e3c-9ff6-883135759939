@@ -6,6 +6,9 @@
 * "切口位置 c" 表示断裂发生在第 c-1 与第 c 个碱基之间（c ∈ [0, L]）。
 * top 链切口与 bottom 链切口位置相同即为平端；不同则产生黏端。
 * 环形序列的切口位置对 L 取模归一化到 [0, L)；位置 0 即跨越原点的切口。
+* 取模后落到同一 (top, bottom) 的切割事件，仅当末端类型与突出端序列
+  一致时才合并为一条记录；末端不一致即冲突，整个计算以
+  CutConflictError 拒绝（否则合并结果会随酶名排序变化）。
 
 末端类型
 --------
@@ -23,6 +26,32 @@ BLUNT = "blunt"
 FIVE_PRIME = "5prime"
 THREE_PRIME = "3prime"
 NONE = "none"
+
+
+class CutConflictError(ValueError):
+    """同一物理切口坐标上末端类型/突出端不一致的切割事件冲突。
+
+    环形序列的切口坐标对长度取模后，原本不同的切割事件可能落到同一
+    ``(top_cut, bottom_cut)``；仅当末端类型与突出端序列一致时才能合并，
+    否则保留哪一端会随酶名排序变化，属于必须拒绝的非法输入。
+
+    ``conflicts`` 按 ``(top_cut, bottom_cut)`` 升序排列，每项为
+    ``{"top_cut", "bottom_cut", "ends": [(end_type, overhang), ...]}``；
+    异常的字符串形式列出全部冲突坐标，可直接作为 422 响应的 detail。
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        parts = []
+        for c in conflicts:
+            ends = " vs ".join(
+                f"{end_type}/{overhang!r}" for end_type, overhang in c["ends"]
+            )
+            parts.append(f"({c['top_cut']}, {c['bottom_cut']}): {ends}")
+        super().__init__(
+            "conflicting cut events at the same physical cut "
+            "(top_cut, bottom_cut): " + "; ".join(parts)
+        )
 
 
 def find_sites(sequence: str, pattern: str, circular: bool):
@@ -66,7 +95,10 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
     反向命中时切口坐标按酶自身坐标系换算回 top 链坐标：
         top_cut    = start + k - cut_bottom
         bottom_cut = start + k - cut_top
-    同一物理切口（top、bottom 均相同）只保留一条记录，酶名与位点合并。
+    同一物理切口（top、bottom 均相同）且末端类型与突出端序列一致的事件
+    只保留一条记录，酶名与位点合并；同坐标事件的末端不一致时（环形取模
+    可能把不同切口归到同一坐标），合并结果会随酶名排序变化，因此收集
+    全部冲突坐标，扫描结束后抛出 CutConflictError。
     返回列表按 (top_cut, bottom_cut) 排序，保证相同输入的输出顺序一致。
     """
     circular = topology == "circular"
@@ -76,6 +108,8 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
     haystack = sequence + sequence[:max_k] if circular else sequence
 
     merged: dict[tuple[int, int], dict] = {}
+    # 同坐标但末端不一致的事件不可合并：先收集冲突，扫描结束后统一报错
+    conflicts: dict[tuple[int, int], set[tuple[str, str]]] = {}
     for enz in sorted(enzymes, key=lambda e: (e.name, e.pattern, e.cut_top, e.cut_bottom)):
         k = len(enz.pattern)
         for oriented in sorted({enz.pattern, reverse_complement(enz.pattern)}):
@@ -102,6 +136,12 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
                         "enzymes": set(),
                         "sites": [],
                     }
+                elif (entry["end_type"], entry["overhang"]) != (end_type, overhang):
+                    ends = conflicts.setdefault(
+                        key, {(entry["end_type"], entry["overhang"])}
+                    )
+                    ends.add((end_type, overhang))
+                    continue
                 entry["enzymes"].add(enz.name)
                 entry["sites"].append(
                     {
@@ -111,6 +151,14 @@ def compute_cuts(sequence: str, topology: str, enzymes) -> list[dict]:
                         "matched": haystack[start : start + k],
                     }
                 )
+
+    if conflicts:
+        raise CutConflictError(
+            [
+                {"top_cut": top, "bottom_cut": bottom, "ends": sorted(ends)}
+                for (top, bottom), ends in sorted(conflicts.items())
+            ]
+        )
 
     cuts = []
     for entry in merged.values():
@@ -214,7 +262,11 @@ def build_fragments(sequence: str, topology: str, cuts: list[dict]) -> list[dict
 
 
 def run_digest(sequence: str, topology: str, enzymes) -> dict:
-    """执行一次完整酶切，返回 {"cuts": [...], "fragments": [...]}。"""
+    """执行一次完整酶切，返回 {"cuts": [...], "fragments": [...]}。
+
+    同坐标切口的末端类型/突出端不一致时抛出 CutConflictError
+    （见 compute_cuts），调用方应将其转为 422 拒绝整个请求。
+    """
     cuts = compute_cuts(sequence, topology, enzymes)
     fragments = build_fragments(sequence, topology, cuts)
     return {"cuts": cuts, "fragments": fragments}

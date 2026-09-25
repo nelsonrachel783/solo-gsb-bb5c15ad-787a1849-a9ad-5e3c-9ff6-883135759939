@@ -160,3 +160,23 @@ def test_invalid_candidate_enzyme_returns_422(client):
     assert _plan(client, body["id"], 2, [ECORI, bad]).status_code == 422
     bad_pattern = {"name": "Bad", "pattern": "GAUZ", "cut_top": 1, "cut_bottom": 1}
     assert _plan(client, body["id"], 2, [bad_pattern]).status_code == 422
+
+
+def test_conflicting_combination_returns_422(client):
+    # 候选组合 {E1, E2} 在环形 AAAA 上的切口取模后落在同一坐标 (0,3)，
+    # 但末端不一致（5prime/AAA 与 3prime/A）：整个规划请求以 422 拒绝
+    body = _create(client, sequence="AAAA", topology="circular")
+    resp = _plan(
+        client,
+        body["id"],
+        2,
+        [
+            {"name": "E1", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+            {"name": "E2", "pattern": "AAAA", "cut_top": 1, "cut_bottom": 0},
+        ],
+    )
+    assert resp.status_code == 422
+    assert "(0, 3)" in resp.json()["detail"]
+    # 规划只读：原记录保持不变，也没有新增任何提交
+    assert client.get(f"/digests/{body['id']}").json() == body
+    assert len(client.get("/digests").json()) == 1

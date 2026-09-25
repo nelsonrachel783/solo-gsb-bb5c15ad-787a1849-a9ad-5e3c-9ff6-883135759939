@@ -198,6 +198,33 @@ def test_missing_record_returns_404(client):
     assert resp.status_code == 404
 
 
+def test_variant_cut_conflict_returns_422_and_keeps_record(client):
+    # 原记录（环形 AAAC）无识别位点、合法保存；变异为 AAAA 后两种酶的
+    # 切口取模落在同一坐标 (0,3) 但末端冲突 -> 422，原记录保持不变
+    resp = client.post(
+        "/digests",
+        json={
+            "sequence": "AAAC",
+            "topology": "circular",
+            "enzymes": [
+                {"name": "E1", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+                {"name": "E2", "pattern": "AAAA", "cut_top": 1, "cut_bottom": 0},
+            ],
+        },
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["cuts"] == []
+
+    resp = _analyze(client, body["id"], [{"position": 3, "alt": "A"}])
+    assert resp.status_code == 422
+    assert "(0, 3)" in resp.json()["detail"]
+
+    # 分析不改原记录，也没有新增任何提交
+    assert client.get(f"/digests/{body['id']}").json() == body
+    assert len(client.get("/digests").json()) == 1
+
+
 def test_variant_analysis_does_not_persist(client):
     body = _create(client)
     _analyze(client, body["id"], [{"position": 4, "alt": "C"}])

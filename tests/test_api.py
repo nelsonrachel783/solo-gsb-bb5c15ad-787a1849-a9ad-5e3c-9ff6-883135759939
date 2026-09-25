@@ -103,6 +103,46 @@ def test_circular_digest_via_api(client):
     assert body["fragments"][0]["length"] == 10
 
 
+def test_circular_cut_conflict_rejects_entire_save(client):
+    # 环形 AAAA 上两种酶的切口取模后落在同一坐标 (0,3)，但末端不一致
+    # （5prime/AAA 与 3prime/A）：整个请求以 422 拒绝，且不落库
+    payload = eco_request(
+        sequence="AAAA",
+        topology="circular",
+        enzymes=[
+            {"name": "E1", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+            {"name": "E2", "pattern": "AAAA", "cut_top": 1, "cut_bottom": 0},
+        ],
+    )
+    resp = client.post("/digests", json=payload)
+    assert resp.status_code == 422
+    assert "(0, 3)" in resp.json()["detail"]
+    assert client.get("/digests").json() == []  # 整次保存被拒绝，无任何落库
+
+
+def test_circular_consistent_same_coordinate_merge_via_api(client):
+    # 取模后同坐标且末端一致（同为 5prime/AAA）：合法合并，照常保存
+    payload = eco_request(
+        sequence="AAAA",
+        topology="circular",
+        enzymes=[
+            {"name": "E1", "pattern": "AAAA", "cut_top": 0, "cut_bottom": 3},
+            {"name": "E2", "pattern": "AAAA", "cut_top": 1, "cut_bottom": 4},
+        ],
+    )
+    resp = client.post("/digests", json=payload)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert len(body["cuts"]) == 4
+    cut = next(
+        c for c in body["cuts"] if (c["top_cut"], c["bottom_cut"]) == (0, 3)
+    )
+    assert cut["enzymes"] == ["E1", "E2"]
+    assert cut["end_type"] == "5prime"
+    assert cut["overhang"] == "AAA"
+    assert [f["length"] for f in body["fragments"]] == [1, 1, 1, 1]
+
+
 def test_circular_shared_top_cut_counts_consistent(client):
     # 两个物理切口共用同一正链坐标：保存两个 cuts，片段按唯一边界生成
     payload = eco_request(
